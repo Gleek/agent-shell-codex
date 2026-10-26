@@ -1,4 +1,4 @@
-;;; agent-shell-codex-tests.el --- Capacity retry tests -*- lexical-binding: t; -*-
+;;; agent-shell-codex-tests.el --- Codex extension tests -*- lexical-binding: t; -*-
 
 (require 'ert)
 (require 'cl-lib)
@@ -92,6 +92,84 @@
     (agent-shell-codex--listen-for-capacity)
     (agent-shell-codex--listen-for-capacity)
     (should (= 1 (length (map-elt agent-shell--state :event-subscriptions))))))
+
+(defmacro agent-shell-codex-test--with-history (&rest body)
+  "Run BODY with a Codex shell and recorded app-server operations."
+  (declare (indent 0))
+  `(agent-shell-codex-test--with-retry
+     (let (operations request-failure
+           (history-mode "paginated"))
+       (cl-letf (((symbol-function 'make-process) (lambda (&rest _) 'test-process))
+                 ((symbol-function 'process-live-p) (lambda (_) nil))
+                 ((symbol-function 'agent-shell-codex--send-json-rpc) #'ignore)
+                 ((symbol-function 'agent-shell-codex--list-turns)
+                  (lambda (_)
+                    '(((id . "first")) ((id . "second")) ((id . "third")))))
+                 ((symbol-function 'completing-read)
+                  (lambda (_prompt collection &rest _)
+                    (seq-find (lambda (item) (string-prefix-p "Turn 2:" item))
+                              (all-completions "" collection))))
+                 ((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                 ((symbol-function 'agent-shell--shutdown)
+                  (lambda () (push "shutdown" operations)))
+                 ((symbol-function 'agent-shell-reload)
+                  (lambda () (push "reload" operations)))
+                 ((symbol-function 'agent-shell-codex--request-using)
+                  (lambda (_process _buffer method params)
+                    (unless (equal method "initialize")
+                      (push (list method params) operations))
+                    (when (and request-failure (equal method "thread/revert"))
+                      (error "Revert failed"))
+                    `((thread . ((historyMode . ,history-mode))))))
+                 ((symbol-function 'agent-shell-codex--request)
+                  (lambda (method params)
+                    (push (list method params) operations)
+                    (when request-failure (error "Archive failed")))))
+         ,@body))))
+
+(ert-deftest agent-shell-codex-rewind-reverts-selected-turn-after-shutdown ()
+  (agent-shell-codex-test--with-history
+    (agent-shell-codex-rewind)
+    (should (equal
+             (reverse operations)
+             '("shutdown"
+               ("thread/resume" ((threadId . "test-session") (excludeTurns . t)))
+               ("thread/revert" ((threadId . "test-session") (beforeTurnId . "second")))
+               "reload")))))
+
+(ert-deftest agent-shell-codex-rewind-reloads-on-failure ()
+  (agent-shell-codex-test--with-history
+    (setq request-failure t)
+    (should-error (agent-shell-codex-rewind))
+    (should (equal (car operations) "reload"))))
+
+(ert-deftest agent-shell-codex-archive-closes-shell-after-shutdown ()
+  (agent-shell-codex-test--with-history
+    (let ((buffer (current-buffer)))
+      (agent-shell-codex-archive-this-session)
+      (should-not (buffer-live-p buffer))
+      (should (equal (reverse operations)
+                     '("shutdown" ("thread/archive" ((threadId . "test-session")))))))))
+
+(ert-deftest agent-shell-codex-archive-reloads-on-failure ()
+  (agent-shell-codex-test--with-history
+    (setq request-failure t)
+    (let ((buffer (current-buffer)))
+      (should-error (agent-shell-codex-archive-this-session))
+      (should (equal (car operations) "reload"))
+      (should (buffer-live-p buffer)))))
+
+(ert-deftest agent-shell-codex-rewind-leaves-legacy-history-unchanged ()
+  (agent-shell-codex-test--with-history
+    (setq history-mode "legacy")
+    (should-error (agent-shell-codex-rewind) :type 'user-error)
+    (should-not (assoc "thread/revert" operations))
+    (should (equal (car operations) "reload"))))
+
+(ert-deftest agent-shell-codex-history-rejects-other-agents ()
+  (agent-shell-codex-test--with-retry
+    (setf (alist-get :agent-config agent-shell--state) '((:identifier . claude)))
+    (should-error (agent-shell-codex--current-shell) :type 'user-error)))
 
 (provide 'agent-shell-codex-tests)
 ;;; agent-shell-codex-tests.el ends here

@@ -8,7 +8,7 @@ LOAD_PATH = -L $(AGENT_SHELL_DIR) -L $(SHELL_MAKER_DIR) -L $(ACP_DIR) -L . $(EXT
 .PHONY: test compile
 
 test:
-	$(EMACS) -Q --batch $(LOAD_PATH) -l tests/agent-shell-codex-tests.el -f ert-run-tests-batch-and-exit
+	$(EMACS) -Q --batch $(LOAD_PATH) -l agent-shell-codex.el -l tests/agent-shell-codex-tests.el -f ert-run-tests-batch-and-exit
 
 compile:
 	$(EMACS) -Q --batch $(LOAD_PATH) --eval '(setq byte-compile-error-on-warn t)' -f batch-byte-compile agent-shell-codex.el

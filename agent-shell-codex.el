@@ -13,9 +13,8 @@
 ;; Provides Codex specific functionality for agent-shell using the
 ;; local Codex app-server protocol.
 ;;
-;; WARNING: The Codex app-server API used here is experimental.  It is
-;; less brittle than editing Codex JSONL files directly, but method
-;; names and payloads may still change across Codex releases.
+;; The Codex app-server API used here is experimental.
+;; Method names and payloads may change across Codex releases.
 
 ;;; Code:
 
@@ -26,22 +25,8 @@
 (require 'seq)
 (require 'subr-x)
 
-(declare-function agent-shell--current-shell "agent-shell")
-(declare-function agent-shell-reload "agent-shell")
-(declare-function agent-shell-openai-start-codex "agent-shell-openai")
 (declare-function term-mode "term")
 (declare-function term-char-mode "term")
-(declare-function agent-shell-status "agent-shell")
-(declare-function agent-shell-subscribe-to "agent-shell")
-(declare-function agent-shell-insert "agent-shell")
-(declare-function agent-shell--prompt-input-start "agent-shell-prompt")
-(declare-function agent-shell--state "agent-shell")
-(declare-function agent-shell--update-header-and-mode-line "agent-shell")
-(defvar agent-shell-header-style)
-(declare-function agent-shell--clean-up "agent-shell")
-(declare-function shell-maker-busy "shell-maker")
-(declare-function map-elt "map")
-(declare-function map-nested-elt "map")
 
 (defgroup agent-shell-codex nil
   "Codex specific extensions for agent-shell."
@@ -146,12 +131,11 @@ starts a ten-second timer.  Streamed messages wait for `turn-complete'."
            :on-event #'agent-shell-codex--capacity-event))
     (add-hook 'kill-buffer-hook #'agent-shell-codex--cancel-capacity-retry nil t)))
 
-(with-eval-after-load 'agent-shell
-  (add-hook 'agent-shell-mode-hook #'agent-shell-codex--listen-for-capacity)
-  (dolist (buffer (buffer-list))
-    (with-current-buffer buffer
-      (when (derived-mode-p 'agent-shell-mode)
-        (agent-shell-codex--listen-for-capacity)))))
+(add-hook 'agent-shell-mode-hook #'agent-shell-codex--listen-for-capacity)
+(dolist (buffer (buffer-list))
+  (with-current-buffer buffer
+    (when (derived-mode-p 'agent-shell-mode)
+      (agent-shell-codex--listen-for-capacity))))
 
 (defun agent-shell-codex--auth (&rest args)
   "Run codex-auth with ARGS and return its JSON response."
@@ -181,7 +165,7 @@ starts a ten-second timer.  Streamed messages wait for `turn-complete'."
 
 ;;;###autoload
 (defun agent-shell-codex-switch-account (account)
-  "Switch the shared CLI account using codex-auth, then start a new shell.
+  "Switch the shared CLI ACCOUNT using codex-auth, then start a new shell.
 Running clients need restarting to pick up the changed login."
   (interactive
    (let* ((accounts (alist-get 'accounts
@@ -205,37 +189,32 @@ Running clients need restarting to pick up the changed login."
   (agent-shell-codex-refresh-usage)
   (agent-shell-openai-start-codex))
 
-(defun agent-shell-codex--next-request-id ()
-  "Return the next Codex app-server JSON-RPC request id."
-  (cl-incf agent-shell-codex--request-id))
-
 (defun agent-shell-codex--current-shell ()
-  "Return the current agent-shell buffer."
-  (if (derived-mode-p 'agent-shell-mode)
-      (current-buffer)
-    (or (agent-shell--current-shell)
-        (user-error "Not in a shell"))))
+  "Return the current Codex shell, or signal a user error."
+  (let ((buffer (or (agent-shell--current-shell)
+                    (user-error "Not in a shell"))))
+    (unless (eq (map-nested-elt (buffer-local-value 'agent-shell--state buffer)
+                               '(:agent-config :identifier)) 'codex)
+      (user-error "Not in a Codex shell"))
+    buffer))
 
 (defun agent-shell-codex--session-id (&optional shell-buffer)
   "Return the Codex session id for SHELL-BUFFER."
   (let* ((buf (or shell-buffer (agent-shell-codex--current-shell)))
-         (state (buffer-local-value 'agent-shell--state buf))
-         (session-id (map-nested-elt state '(:session :id))))
+         (session-id (map-nested-elt (buffer-local-value 'agent-shell--state buf)
+                                     '(:session :id))))
     (unless session-id
       (user-error "No active session"))
     session-id))
 
 (defun agent-shell-codex--ensure-ready (shell-buffer)
   "Signal an error unless SHELL-BUFFER is ready for history mutation."
-  (unless (with-current-buffer shell-buffer
-            (if (fboundp 'agent-shell-status)
-                (eq (agent-shell-status :shell-buffer shell-buffer) 'ready)
-              (not (shell-maker-busy))))
+  (unless (eq (agent-shell-status :shell-buffer shell-buffer) 'ready)
     (user-error "Codex session is busy; try again when the turn finishes")))
 
 (defun agent-shell-codex--json-rpc-request (method &optional params)
   "Return a JSON-RPC request object for METHOD and PARAMS."
-  `((id . ,(agent-shell-codex--next-request-id))
+  `((id . ,(cl-incf agent-shell-codex--request-id))
     (method . ,method)
     ,@(when params `((params . ,params)))))
 
@@ -295,16 +274,11 @@ its output buffer."
                     :noquery t)))
      (unwind-protect
          (progn
-           (let* ((request (agent-shell-codex--json-rpc-request
-                            "initialize"
-                            '((clientInfo
-                               (name . "agent-shell-codex")
-                               (version . "0.1"))
-                              (capabilities
-                               (experimentalApi . t)))))
-                  (request-id (alist-get 'id request)))
-             (agent-shell-codex--send-json-rpc process request)
-             (agent-shell-codex--wait-response process buffer request-id))
+           (agent-shell-codex--request-using
+            process buffer "initialize"
+            '((clientInfo (name . "agent-shell-codex") (version . "0.1"))
+              (capabilities (experimentalApi . t))))
+           (agent-shell-codex--send-json-rpc process '((method . "initialized")))
            ,@body)
        (when (process-live-p process)
          (delete-process process))
@@ -468,13 +442,12 @@ Uses `agent-shell-codex-show-usage-indicator' to control header visibility."
                        (buffer-list)))
     (agent-shell-codex-refresh-usage)))
 
-(with-eval-after-load 'agent-shell
-  (advice-add 'agent-shell--make-header-model :filter-return
-              #'agent-shell-codex--add-quota-to-header)
-  (when (timerp agent-shell-codex--quota-timer)
-    (cancel-timer agent-shell-codex--quota-timer))
-  (setq agent-shell-codex--quota-timer
-        (run-at-time 0 60 #'agent-shell-codex--poll-quota)))
+(advice-add 'agent-shell--make-header-model :filter-return
+            #'agent-shell-codex--add-quota-to-header)
+(when (timerp agent-shell-codex--quota-timer)
+  (cancel-timer agent-shell-codex--quota-timer))
+(setq agent-shell-codex--quota-timer
+      (run-at-time 0 60 #'agent-shell-codex--poll-quota))
 
 (defun agent-shell-codex--turn-text (turn)
   "Return a displayable user message preview for TURN."
@@ -505,121 +478,50 @@ Uses `agent-shell-codex-show-usage-indicator' to control header visibility."
          (turns (alist-get 'data result)))
     (nreverse turns)))
 
-(defun agent-shell-codex--thread-path (thread)
-  "Return rollout path from THREAD, or signal a user error."
-  (let ((path (alist-get 'path thread)))
-    (unless (and (stringp path) (file-exists-p path))
-      (user-error "Codex rollout file not found: %S" path))
-    path))
-
-(defun agent-shell-codex--turn-start-line (jsonl-path turn-id)
-  "Return 1-based line number where TURN-ID starts in JSONL-PATH."
-  (let ((line-number 0)
-        found)
-    (with-temp-buffer
-      (insert-file-contents jsonl-path)
-      (goto-char (point-min))
-      (while (and (not found) (not (eobp)))
-        (cl-incf line-number)
-        (let* ((line (buffer-substring-no-properties
-                      (line-beginning-position)
-                      (line-end-position)))
-               (obj (agent-shell-codex--parse-json-line line))
-               (payload (alist-get 'payload obj)))
-          (when (and (equal (alist-get 'type obj) "event_msg")
-                     (equal (alist-get 'type payload) "task_started")
-                     (equal (alist-get 'turn_id payload) turn-id))
-            (setq found line-number)))
-        (forward-line 1)))
-    found))
-
-(defun agent-shell-codex--truncate-jsonl-before-turn (jsonl-path turn-id)
-  "Truncate JSONL-PATH before TURN-ID.
-Creates a backup at JSONL-PATH.bak before truncating."
-  (let ((line-before (agent-shell-codex--turn-start-line jsonl-path turn-id))
-        (backup (concat jsonl-path ".bak")))
-    (unless line-before
-      (user-error "Could not find Codex turn %s in %s" turn-id jsonl-path))
-    (copy-file jsonl-path backup t)
-    (let ((lines (split-string (with-temp-buffer
-                                 (insert-file-contents jsonl-path)
-                                 (buffer-string))
-                               "\n" t)))
-      (with-temp-file jsonl-path
-        (dolist (line (seq-take lines (1- line-before)))
-          (insert line "\n"))))
-    backup))
-
 ;;;###autoload
 (defun agent-shell-codex-rewind ()
-  "Rewind the current Codex session to before an earlier turn.
-This uses Codex's local app-server `thread/rollback' method and then
-reloads the agent-shell buffer so codex-acp reloads the mutated
-history."
+  "Rewind the current Codex session to before a selected turn.
+Use `thread/revert' to update paginated history, then reload the shell.
+Project files are unchanged.  Legacy history must be migrated first."
   (interactive)
   (let* ((shell-buffer (agent-shell-codex--current-shell))
          (session-id (agent-shell-codex--session-id shell-buffer)))
     (agent-shell-codex--ensure-ready shell-buffer)
-    (agent-shell-codex--with-app-server
-      (let* ((result (agent-shell-codex--request-using
-                      process buffer
-                      "thread/turns/list"
-                      `((threadId . ,session-id)
-                        (limit . 100)
-                        (sortDirection . "desc")
-                        (itemsView . "summary"))))
-             (turns (nreverse (alist-get 'data result))))
-        (unless (> (length turns) 1)
-          (user-error "Not enough turns to rewind (need at least 2)"))
-        (let* ((candidates
-                (nreverse
-                 (cl-loop for turn in (cdr turns)
-                          for index from 1
-                          collect (cons (format "Turn %d: %s"
-                                                index
-                                                (agent-shell-codex--turn-text turn))
-                                        (list :turn turn :index index)))))
-               (candidate-strings (mapcar #'car candidates))
-               (selection (completing-read
-                           "Rewind to before: "
-                           (lambda (string pred action)
-                             (if (eq action 'metadata)
-                                 '(metadata (display-sort-function . identity))
-                               (complete-with-action action candidate-strings string pred)))
-                           nil t))
-               (selected (cdr (assoc selection candidates)))
-               (turn-index (plist-get selected :index))
-               (turn-id (alist-get 'id (plist-get selected :turn)))
-               (num-turns (- (length turns) turn-index)))
-          (when (yes-or-no-p
-                 (format "Rewind Codex session to before turn %d? (drops %d turns)"
-                         turn-index num-turns))
-            ;; `thread/rollback' currently only works on a loaded app-server
-            ;; thread, while `thread/turns/list' can read directly from disk.
-            (let* ((resume-result
-                    (agent-shell-codex--request-using
-                     process buffer
-                     "thread/resume"
-                     `((threadId . ,session-id)
-                       (excludeTurns . t))))
-                   (jsonl-path
-                    (agent-shell-codex--thread-path
-                     (alist-get 'thread resume-result)))
-                   ;; Resolve this before rollback so a missing physical
-                   ;; boundary fails without mutating Codex history.
-                   (_line-before
-                    (or (agent-shell-codex--turn-start-line jsonl-path turn-id)
-                        (user-error "Could not find Codex turn %s in %s"
-                                    turn-id jsonl-path))))
-            (agent-shell-codex--request-using
-             process buffer
-             "thread/rollback"
-             `((threadId . ,session-id)
-               (numTurns . ,num-turns)))
-            (agent-shell-codex--truncate-jsonl-before-turn jsonl-path turn-id)
-            (with-current-buffer shell-buffer
-              (agent-shell-reload))
-            (message "Codex session rewound"))))))))
+    (let* ((turns (agent-shell-codex--list-turns session-id))
+           (candidates (cl-loop for turn in (cdr turns)
+                                for index from 2
+                                collect (cons (format "Turn %d: %s" index
+                                                      (agent-shell-codex--turn-text turn))
+                                              (alist-get 'id turn)))))
+      (unless candidates
+        (user-error "Not enough turns to rewind (need at least 2)"))
+      (let* ((selection (completing-read
+                         "Rewind to before: "
+                         (lambda (string pred action)
+                           (if (eq action 'metadata)
+                               '(metadata (display-sort-function . identity))
+                             (complete-with-action action (reverse candidates) string pred)))
+                         nil t))
+             (turn-id (cdr (assoc selection candidates))))
+        (when (yes-or-no-p (format "Rewind to before %s? " selection))
+          (with-current-buffer shell-buffer
+            (agent-shell--shutdown)
+            (unwind-protect
+                (agent-shell-codex--with-app-server
+                  (unless (equal
+                           (map-nested-elt
+                            (agent-shell-codex--request-using
+                             process buffer "thread/resume"
+                             `((threadId . ,session-id) (excludeTurns . t)))
+                            '(thread historyMode))
+                           "paginated")
+                    (user-error "Migrate legacy history first: codex migrate-rollouts --thread %s --apply"
+                                session-id))
+                  (agent-shell-codex--request-using
+                   process buffer "thread/revert"
+                   `((threadId . ,session-id) (beforeTurnId . ,turn-id))))
+              (agent-shell-reload)))
+          (message "Codex session rewound"))))))
 
 ;;;###autoload
 (defun agent-shell-codex-archive-this-session ()
@@ -632,11 +534,14 @@ state."
          (session-id (agent-shell-codex--session-id shell-buffer)))
     (agent-shell-codex--ensure-ready shell-buffer)
     (when (yes-or-no-p "Archive current Codex session? ")
-      (agent-shell-codex--request
-       "thread/archive"
-       `((threadId . ,session-id)))
       (with-current-buffer shell-buffer
-        (agent-shell--clean-up))
+        (agent-shell--shutdown)
+        (condition-case err
+            (agent-shell-codex--request "thread/archive"
+                                        `((threadId . ,session-id)))
+          (error
+           (agent-shell-reload)
+           (signal (car err) (cdr err)))))
       (kill-buffer shell-buffer)
       (message "Archived Codex session %s" session-id))))
 

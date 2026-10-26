@@ -72,11 +72,21 @@ Retries skip busy sessions and leave unsubmitted shell input alone.
 
 The Codex app-server protocol is experimental. Methods and payloads may change.
 
-Rewind uses `thread/rollback`, truncates the local rollout JSONL before the
-selected turn, and reloads the shell. It writes a `.bak` copy beside the rollout
-before truncation; another rewind replaces that backup. Rewinding chat history
-does not undo project file edits. Archive uses `thread/archive`. Both commands
-require an idle shell and ask for confirmation.
+Rewind uses `thread/revert` to discard the selected turn and all later turns,
+then reloads the shell. Project files are unchanged. It requires Codex's
+paginated history format. To migrate an older session, run:
+
+```sh
+codex migrate-rollouts --thread SESSION_ID --apply
+```
+
+This requires a Codex version that supports `thread/revert` (tested with
+0.163.0). The removed `thread/rollback` API and direct JSONL edits are no
+longer used. Archive uses `thread/archive`.
+
+Both commands require an idle Codex shell and ask for confirmation. They stop
+the ACP client before changing history to release its writer lock. Rewind
+reloads the shell even if the operation fails; archive reloads on failure.
 
 ## Development
 
